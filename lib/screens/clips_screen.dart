@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -91,9 +92,8 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
         await _clipApi.clearCache();
       }
       
-      // Use ImprovedClipApi for better caching and pagination support
-      // For PageView, we'll load all clips but with smart caching
-      final clips = await _clipApi.getAllClips(page: 1, limit: 1000, forceRefresh: isRefresh);
+      // ✅ Load only first 20 clips initially for fast display
+      final clips = await _clipApi.getAllClips(page: 1, limit: 20, forceRefresh: isRefresh);
       if (mounted) {
         setState(() {
           _clips = clips;
@@ -116,8 +116,13 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
             debugPrint('⚠️ Error in _initializeCurrentVideo: $e');
           });
           
-          // Load saved status in parallel (non-blocking)
+          // ✅ Load saved status in parallel (non-blocking, don't wait)
           _loadSavedStatus();
+          
+          // ✅ Load more clips in background after initial display
+          if (!isRefresh) {
+            _loadMoreClipsInBackground();
+          }
         } else {
           // No clips - mark as initialized anyway
           if (mounted) {
@@ -141,17 +146,30 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
 
   Future<void> _loadSavedStatus() async {
     try {
-      // Load all saved reels once instead of checking each one individually
-      final savedReels = await _projectApi.getSavedReels();
-      
-      if (mounted) {
+      // ✅ Check cache first, API second (non-blocking)
+      final cachedIds = await _getCachedSavedIds();
+      if (cachedIds.isNotEmpty && mounted) {
         setState(() {
           _savedReelIds.clear();
-          for (final reel in savedReels) {
-            _savedReelIds[reel.id] = true;
+          for (var id in cachedIds) {
+            _savedReelIds[id] = true;
           }
         });
       }
+      
+      // ✅ Then update from API in background (don't wait)
+      _projectApi.getSavedReels().then((savedReels) {
+        if (mounted) {
+          setState(() {
+            _savedReelIds.clear();
+            for (final reel in savedReels) {
+              _savedReelIds[reel.id] = true;
+            }
+          });
+        }
+      }).catchError((e) {
+        debugPrint('⚠️ Error loading saved status from API: $e');
+      });
     } catch (e) {
       debugPrint('⚠️ Error loading saved status: $e');
       // If loading fails, set all to false
@@ -160,6 +178,30 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
           _savedReelIds.clear();
         });
       }
+    }
+  }
+  
+  /// Get cached saved IDs (instant, non-blocking)
+  Future<List<String>> _getCachedSavedIds() async {
+    // This would use SharedPreferences if implemented
+    // For now, return empty list
+    return [];
+  }
+  
+  /// ✅ Load more clips in background after initial display
+  void _loadMoreClipsInBackground() async {
+    try {
+      // Wait 2 seconds, then load more clips
+      await Future.delayed(const Duration(seconds: 2));
+      final moreClips = await _clipApi.getAllClips(page: 2, limit: 100, forceRefresh: false);
+      
+      if (mounted && moreClips.isNotEmpty) {
+        setState(() {
+          _clips.addAll(moreClips);
+        });
+      }
+    } catch (e) {
+      debugPrint('⚠️ Error loading more clips: $e');
     }
   }
 
@@ -179,6 +221,13 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
     }
     
     await _initializeVideoAt(_currentIndex);
+    
+    // ✅ Preload next video in background (don't wait)
+    if (_currentIndex + 1 < _clips.length) {
+      _initializeVideoAt(_currentIndex + 1).catchError((e) {
+        debugPrint('⚠️ Preload failed: $e');
+      });
+    }
   }
   
   Future<void> _initializeVideoAt(int index) async {
@@ -193,37 +242,100 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
     final videoUrl = clip.videoUrl;
     if (videoUrl.isEmpty) return;
     
-    try {
-      debugPrint('🔄 ClipsScreen: Initializing video at index $index');
-      final controller = VideoPlayerController.networkUrl(Uri.parse(videoUrl));
-      
-      await controller.initialize().timeout(
-        const Duration(seconds: 15),
-        onTimeout: () {
-          controller.dispose();
-          throw TimeoutException('Video initialization timeout');
-        },
-      );
-      
-      controller.setLooping(true);
-      if (index == _currentIndex && _isVisible) {
-        controller.play();
+    // ✅ Adaptive timeout: Android needs more time
+    final baseTimeout = Platform.isAndroid 
+        ? const Duration(seconds: 15)  // Android needs more time
+        : const Duration(seconds: 6);
+    
+    // ✅ Retry mechanism with exponential backoff
+    VideoPlayerController? controller;
+    Exception? lastError;
+    
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        debugPrint('🔄 ClipsScreen: Initializing video at index $index (attempt $attempt/3)');
+        
+        // Dispose previous controller if retrying
+        if (controller != null && attempt > 1) {
+          try {
+            await controller.dispose();
+          } catch (_) {}
+        }
+        
+        controller = VideoPlayerController.networkUrl(
+          Uri.parse(videoUrl),
+          videoPlayerOptions: VideoPlayerOptions(
+            mixWithOthers: false,
+            allowBackgroundPlayback: false,
+          ),
+        );
+        
+        // ✅ Increase timeout with each attempt
+        final timeoutDuration = Duration(
+          seconds: baseTimeout.inSeconds * attempt, // 15s, 30s, 45s on Android
+        );
+        
+        await controller.initialize().timeout(
+          timeoutDuration,
+          onTimeout: () {
+            controller?.dispose();
+            throw TimeoutException('Video initialization timeout after ${timeoutDuration.inSeconds}s');
+          },
+        );
+        
+        // ✅ Success! Setup controller
+        controller.setLooping(true);
+        if (index == _currentIndex && _isVisible) {
+          controller.play();
+        }
+        
+        if (mounted) {
+          setState(() {
+            _controllers[index] = controller!;
+          });
+        }
+        
+        debugPrint('✅ ClipsScreen: Video initialized successfully at index $index');
+        return; // Success, exit retry loop
+        
+      } catch (e) {
+        lastError = e is Exception ? e : Exception(e.toString());
+        debugPrint('❌ ClipsScreen: Error initializing video at $index (attempt $attempt/3): $e');
+        
+        // ✅ Check for 4K errors ONLY (don't retry 4K videos)
+        // Note: MediaCodec errors on 1080p videos should still retry
+        final errorStr = e.toString().toLowerCase();
+        final is4KError = errorStr.contains('3840') || 
+                         (errorStr.contains('4k') && errorStr.contains('2160')) ||
+                         (errorStr.contains('3840') && errorStr.contains('2160'));
+        
+        if (is4KError) {
+          debugPrint('⚠️ ClipsScreen: 4K video detected (3840x2160), marking as failed');
+          _failedVideoIndices.add(index);
+          if (mounted) setState(() {});
+          return; // Don't retry 4K videos
+        }
+        
+        // ✅ For 1080p videos with MediaCodec errors, continue retrying
+        // This helps with network issues and temporary codec problems
+        
+        // ✅ If not last attempt, wait before retry (exponential backoff)
+        if (attempt < 3) {
+          final backoffDelay = Duration(seconds: attempt); // 1s, 2s
+          debugPrint('⏳ ClipsScreen: Waiting ${backoffDelay.inSeconds}s before retry...');
+          await Future.delayed(backoffDelay);
+        }
       }
-      
-      if (mounted) {
-        setState(() {
-          _controllers[index] = controller;
-        });
-      }
-    } catch (e) {
-      debugPrint('❌ Error initializing video at $index: $e');
-      final errorStr = e.toString().toLowerCase();
-      if (errorStr.contains('3840') || errorStr.contains('4k') || 
-          errorStr.contains('mediacodec') || errorStr.contains('decoder')) {
-        _failedVideoIndices.add(index);
-      }
-      if (mounted) setState(() {});
     }
+    
+    // ✅ All attempts failed
+    debugPrint('❌ ClipsScreen: Failed to initialize video at $index after 3 attempts');
+    if (controller != null) {
+      try {
+        await controller.dispose();
+      } catch (_) {}
+    }
+    if (mounted) setState(() {});
   }
 
   void _onPageChanged(int index) {
@@ -243,12 +355,9 @@ class ClipsScreenState extends State<ClipsScreen> with WidgetsBindingObserver {
         });
       }
       
-      // Initialize current video if not already loaded
+      // ✅ Initialize current video if not already loaded
       _initializeCurrentVideo().then((_) {
-        // Also preload next video
-        if (index + 1 < _clips.length && !_failedVideoIndices.contains(index + 1)) {
-          _initializeVideoAt(index + 1);
-        }
+        // Preload next video is already handled in _initializeCurrentVideo
       }).catchError((e) {
         debugPrint('⚠️ Error initializing current video after page change: $e');
       });
@@ -512,10 +621,12 @@ ${clip.description}
     final isSaved = _savedReelIds[clip.id] ?? false;
     final videoFailed = _failedVideoIndices.contains(index);
     
-    // Initialize videos that are visible or about to be visible
+    // ✅ Start loading immediately if not loaded (don't wait)
     if (controller == null && _isInitialized && !videoFailed &&
         (index == _currentIndex || index == _currentIndex + 1 || index == _currentIndex - 1)) {
-      _initializeVideoAt(index);
+      _initializeVideoAt(index).catchError((e) {
+        debugPrint('⚠️ Error initializing video at $index: $e');
+      });
     }
 
     return Stack(
@@ -551,7 +662,7 @@ ${clip.description}
                 )
               : _buildLoadingPlaceholder(),
         ),
-        // Show "Unsupported" indicator for failed 4K videos
+        // Show "Unsupported" indicator for failed videos
         if (videoFailed)
           Center(
             child: Container(
@@ -563,10 +674,10 @@ ${clip.description}
               child: const Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.hd, color: Colors.white70, size: 40),
+                  Icon(Icons.error_outline, color: Colors.white70, size: 40),
                   SizedBox(height: 4),
                   Text(
-                    '4K Video\nDevice unsupported',
+                    'Video playback\nnot supported',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
@@ -771,26 +882,36 @@ ${clip.description}
   }
 
   Widget _buildLoadingPlaceholder() {
+    return _buildFastLoadingPlaceholder(_clips.isNotEmpty && _currentIndex < _clips.length 
+        ? _clips[_currentIndex] 
+        : null);
+  }
+  
+  /// ✅ Fast loading placeholder with thumbnail support
+  Widget _buildFastLoadingPlaceholder(ClipModel? clip) {
     return Container(
       color: Colors.black,
-      child: const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // ✅ Show thumbnail immediately if available
+          if (clip != null && clip.thumbnail.isNotEmpty)
+            Image.network(
+              clip.thumbnail,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => Container(color: Colors.grey[900]),
+            )
+          else
+            Container(color: Colors.grey[900]),
+          
+          // Small loading indicator
+          Center(
+            child: CircularProgressIndicator(
               color: Color(0xFFE50914),
-              strokeWidth: 3,
+              strokeWidth: 2,
             ),
-            SizedBox(height: 16),
-            Text(
-              'Loading video...',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

@@ -91,10 +91,15 @@ class ImprovedClipApi {
   }) async {
     final cacheKey = 'all_clips_page_${page}_limit_$limit';
     
-    // Check page cache first
+    // ✅ Return cache immediately, then refresh in background
     if (!forceRefresh && _isPageCacheValid(cacheKey)) {
-      debugPrint('⚡ ImprovedClipApi: Returning ${_pageCache[cacheKey]!.length} clips from page cache (page $page)');
-      return _pageCache[cacheKey]!;
+      final cachedClips = _pageCache[cacheKey]!;
+      debugPrint('⚡ INSTANT: Returning ${cachedClips.length} clips from cache');
+      
+      // ✅ Refresh in background (don't wait)
+      _refreshCacheInBackground(page, limit, cacheKey);
+      
+      return cachedClips;
     }
     
     try {
@@ -171,6 +176,53 @@ class ImprovedClipApi {
     } catch (e) {
       debugPrint('❌ ImprovedClipApi: Unexpected error: $e');
       return [];
+    }
+  }
+  
+  /// ✅ Refresh cache in background (non-blocking)
+  void _refreshCacheInBackground(int page, int limit, String cacheKey) async {
+    try {
+      await Future.delayed(const Duration(seconds: 3));
+      
+      final response = await _dioClient.dio.get(
+        '/reels',
+        queryParameters: {'page': page, 'limit': limit},
+      );
+      
+      // Update cache without blocking
+      List<dynamic> list;
+      if (response.data is List) {
+        list = response.data as List;
+      } else if (response.data is Map<String, dynamic>) {
+        final map = response.data as Map<String, dynamic>;
+        list = (map['reels'] as List<dynamic>?) ?? 
+               (map['data'] as List<dynamic>?) ?? 
+               (map['clips'] as List<dynamic>?) ?? 
+               <dynamic>[];
+      } else {
+        list = <dynamic>[];
+      }
+      
+      if (list.isNotEmpty) {
+        final clips = list.map((e) => ClipModel.fromJson(e as Map<String, dynamic>)).toList();
+        
+        // Update individual clip cache
+        for (var clip in clips) {
+          _clipCache[clip.id] = clip;
+          _updateCacheTimestamp(clip.id);
+        }
+        
+        // Update page cache
+        _pageCache[cacheKey] = clips;
+        _updatePageCacheTimestamp(cacheKey);
+        
+        // Sync liked status
+        await _syncLikedStatus(clips);
+        
+        debugPrint('✅ ImprovedClipApi: Background refresh completed for page $page');
+      }
+    } catch (e) {
+      debugPrint('⚠️ ImprovedClipApi: Background refresh failed: $e');
     }
   }
   

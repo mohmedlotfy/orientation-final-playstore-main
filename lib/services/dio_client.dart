@@ -82,10 +82,12 @@ class DioClient {
         connectTimeout: const Duration(seconds: 15),
         receiveTimeout: const Duration(seconds: 20),
         sendTimeout: const Duration(seconds: 15),
+        responseType: ResponseType.json,  // ✅ Explicitly set response type
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
+          'Accept': 'application/json, text/html, */*',  // ✅ Accept multiple MIME types
           'Connection': 'keep-alive',
+          'User-Agent': 'Flutter-App/1.0',  // ✅ Add User-Agent to help server identify client
         },
       ),
     );
@@ -117,6 +119,25 @@ class DioClient {
           if (error.response != null) {
             print('Response: ${error.response?.data}');
             print('Status: ${error.response?.statusCode}');
+          }
+          
+          // ✅ Handle 406 Not Acceptable - server doesn't accept our MIME type
+          if (error.response?.statusCode == 406) {
+            print('⚠️ 406 Not Acceptable - Server rejected MIME type');
+            print('   Request path: ${error.requestOptions.path}');
+            print('   Accept header: ${error.requestOptions.headers['Accept']}');
+            
+            // Try to retry with different Accept header
+            try {
+              final opts = error.requestOptions;
+              opts.headers['Accept'] = '*/*';  // Accept any MIME type
+              print('🔄 Retrying request with Accept: */*');
+              final response = await dio.fetch(opts);
+              return handler.resolve(response);
+            } catch (e) {
+              print('❌ Retry with */* failed: $e');
+              return handler.next(error);
+            }
           }
           
           // Auto-refresh token on 401 (except for auth endpoints)

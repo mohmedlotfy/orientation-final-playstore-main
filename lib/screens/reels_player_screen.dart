@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -55,12 +56,14 @@ class _ReelsPlayerScreenState extends State<ReelsPlayerScreen> with WidgetsBindi
       });
     }
     
-    // Load initial video (non-blocking for UI)
+    // ✅ Load initial video (non-blocking for UI)
     _initializeCurrentVideo();
     
-    // Load liked and saved status in parallel (non-blocking)
-    _loadLikedStatus();
-    _loadSavedStatus();
+    // ✅ Load liked and saved status in parallel (non-blocking, don't wait)
+    Future.wait([
+      _loadLikedStatus(),
+      _loadSavedStatus(),
+    ]).catchError((e) => debugPrint('⚠️ Error loading status: $e'));
   }
 
   @override
@@ -136,6 +139,13 @@ class _ReelsPlayerScreenState extends State<ReelsPlayerScreen> with WidgetsBindi
     }
     
     await _initializeVideoAt(_currentIndex);
+    
+    // ✅ Preload next video in background (don't wait)
+    if (_currentIndex + 1 < widget.clips.length) {
+      _initializeVideoAt(_currentIndex + 1).catchError((e) {
+        debugPrint('⚠️ Preload failed: $e');
+      });
+    }
   }
   
   Future<void> _initializeVideoAt(int index) async {
@@ -150,42 +160,105 @@ class _ReelsPlayerScreenState extends State<ReelsPlayerScreen> with WidgetsBindi
     final videoUrl = clip.videoUrl;
     if (videoUrl.isEmpty) return;
     
-    try {
-      debugPrint('🔄 ReelsPlayerScreen: Initializing video at index $index');
-      final controller = VideoPlayerController.networkUrl(Uri.parse(videoUrl));
-      
-      await controller.initialize().timeout(
-        const Duration(seconds: 15),
-        onTimeout: () {
-          controller.dispose();
-          throw TimeoutException('Video initialization timeout');
-        },
-      );
-      
-      controller.setLooping(true);
-      if (index == _currentIndex) {
-        controller.play();
+    // ✅ Adaptive timeout: Android needs more time
+    final baseTimeout = Platform.isAndroid 
+        ? const Duration(seconds: 15)  // Android needs more time
+        : const Duration(seconds: 6);
+    
+    // ✅ Retry mechanism with exponential backoff
+    VideoPlayerController? controller;
+    Exception? lastError;
+    
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        debugPrint('🔄 ReelsPlayerScreen: Initializing video at index $index (attempt $attempt/3)');
+        
+        // Dispose previous controller if retrying
+        if (controller != null && attempt > 1) {
+          try {
+            await controller.dispose();
+          } catch (_) {}
+        }
+        
+        controller = VideoPlayerController.networkUrl(
+          Uri.parse(videoUrl),
+          videoPlayerOptions: VideoPlayerOptions(
+            mixWithOthers: false,
+            allowBackgroundPlayback: false,
+          ),
+        );
+        
+        // ✅ Increase timeout with each attempt
+        final timeoutDuration = Duration(
+          seconds: baseTimeout.inSeconds * attempt, // 15s, 30s, 45s on Android
+        );
+        
+        await controller.initialize().timeout(
+          timeoutDuration,
+          onTimeout: () {
+            controller?.dispose();
+            throw TimeoutException('Video initialization timeout after ${timeoutDuration.inSeconds}s');
+          },
+        );
+        
+        // ✅ Success! Setup controller
+        controller.setLooping(true);
+        if (index == _currentIndex) {
+          controller.play();
+        }
+        
+        if (!_listenersAdded.contains(index)) {
+          controller.addListener(_onVideoStateChanged);
+          _listenersAdded.add(index);
+        }
+        
+        if (mounted) {
+          setState(() {
+            _controllers[index] = controller!;
+          });
+        }
+        
+        debugPrint('✅ ReelsPlayerScreen: Video initialized successfully at index $index');
+        return; // Success, exit retry loop
+        
+      } catch (e) {
+        lastError = e is Exception ? e : Exception(e.toString());
+        debugPrint('❌ ReelsPlayerScreen: Error initializing video at $index (attempt $attempt/3): $e');
+        
+        // ✅ Check for 4K errors ONLY (don't retry 4K videos)
+        // Note: MediaCodec errors on 1080p videos should still retry
+        final errorStr = e.toString().toLowerCase();
+        final is4KError = errorStr.contains('3840') || 
+                         (errorStr.contains('4k') && errorStr.contains('2160')) ||
+                         (errorStr.contains('3840') && errorStr.contains('2160'));
+        
+        if (is4KError) {
+          debugPrint('⚠️ ReelsPlayerScreen: 4K video detected (3840x2160), marking as failed');
+          _failedVideoIndices.add(index);
+          if (mounted) setState(() {});
+          return; // Don't retry 4K videos
+        }
+        
+        // ✅ For 1080p videos with MediaCodec errors, continue retrying
+        // This helps with network issues and temporary codec problems
+        
+        // ✅ If not last attempt, wait before retry (exponential backoff)
+        if (attempt < 3) {
+          final backoffDelay = Duration(seconds: attempt); // 1s, 2s
+          debugPrint('⏳ ReelsPlayerScreen: Waiting ${backoffDelay.inSeconds}s before retry...');
+          await Future.delayed(backoffDelay);
+        }
       }
-      
-      if (!_listenersAdded.contains(index)) {
-        controller.addListener(_onVideoStateChanged);
-        _listenersAdded.add(index);
-      }
-      
-      if (mounted) {
-        setState(() {
-          _controllers[index] = controller;
-        });
-      }
-    } catch (e) {
-      debugPrint('❌ Error initializing video at $index: $e');
-      final errorStr = e.toString().toLowerCase();
-      if (errorStr.contains('3840') || errorStr.contains('4k') || 
-          errorStr.contains('mediacodec') || errorStr.contains('decoder')) {
-        _failedVideoIndices.add(index);
-      }
-      if (mounted) setState(() {});
     }
+    
+    // ✅ All attempts failed
+    debugPrint('❌ ReelsPlayerScreen: Failed to initialize video at $index after 3 attempts');
+    if (controller != null) {
+      try {
+        await controller.dispose();
+      } catch (_) {}
+    }
+    if (mounted) setState(() {});
   }
 
   void _onPageChanged(int index) {
@@ -201,8 +274,8 @@ class _ReelsPlayerScreenState extends State<ReelsPlayerScreen> with WidgetsBindi
       _currentIndex = index;
     });
     
-    // Initialize video for new index
-    _initializeVideoAt(index);
+    // ✅ Initialize video for new index (preloads next automatically)
+    _initializeCurrentVideo();
   }
 
   void _onVideoStateChanged() {
@@ -772,22 +845,19 @@ ${clip.description}
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // Thumbnail as background (dimmed)
+          // ✅ Show thumbnail immediately if available (not dimmed for better visibility)
           if (clip.thumbnail.isNotEmpty)
-            Opacity(
-              opacity: 0.2,
-              child: clip.isAsset
-                  ? Image.asset(
-                      clip.thumbnail,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(color: Colors.grey[900]),
-                    )
-                  : Image.network(
-                      clip.thumbnail,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(color: Colors.grey[900]),
-                    ),
-            )
+            clip.isAsset
+                ? Image.asset(
+                    clip.thumbnail,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(color: Colors.grey[900]),
+                  )
+                : Image.network(
+                    clip.thumbnail,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(color: Colors.grey[900]),
+                  )
           else
             Container(color: Colors.grey[900]),
           // Download indicator - prominent with download icon
